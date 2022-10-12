@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+from tempfile import NamedTemporaryFile
+from typing import List
+
+YESES = [
+    'y',
+    'ye',
+    'yes',
+    'yess',
+    'yesss',
+    'yeah',
+    'yeehaw',
+]
+
+
+SSH = 'ssh -T'
+
+
+class Host:
+    def check_call(self, args, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
+        raise NotImplemented
+
+    def check_output(self, args, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
+        raise NotImplemented
+
+    def read(self, file_path: str) -> str:
+        raise NotImplemented
+
+    def write(self, file_path: str, contents: str) -> None:
+        raise NotImplemented
+
+    def append(self, file_path: str, *contents: str) -> None:
+        raise NotImplemented
+
+    def apt_update(self) -> None:
+        self.check_call(['apt-get', 'update'])
+
+    def apt_install(self, *package: str) -> None:
+        self.check_call(['apt-get', 'install', '-y', *package])
+
+
+class LocalHost(Host):
+    def check_call(self, args, *subprocess_check_call_args, **subprocess_check_output_kwargs) -> None:
+        subprocess.check_call(args, *subprocess_check_call_args, **subprocess_check_output_kwargs)
+
+    def check_output(self, args, *subprocess_check_output_args, **subprocess_check_call_kwargs) -> str:
+        return subprocess.check_output(args, *subprocess_check_output_args, **subprocess_check_call_kwargs).decode('utf-8').strip()
+
+    def read(self, file_path: str) -> str:
+        with open (file_path) as f:
+            return f.read()
+
+    def write(self, file_path: str, contents: str) -> None:
+        with open(file_path, 'w') as f:
+            f.write(contents)
+
+    def append(self, file_path: str, *contents: str) -> None:
+        with open(file_path, 'a') as f:
+            f.write('\n'.join(contents))
+
+
+class SshHost(Host):
+    def __init__(self, ssh: str, host: str):
+        self._ssh = ssh
+        self._host = host
+
+    def check_call(self, args, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
+        subprocess.check_call([*self._ssh, self._host, *args], *subprocess_check_call_args, **subprocess_check_call_kwargs)
+
+    def check_output(self, args, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
+        return subprocess.check_output([*self._ssh, self._host, *args], *subprocess_check_output_args, **subprocess_check_output_kwargs).decode('utf-8').strip()
+
+    def read(self, file_path: str) -> str:
+        return self.check_output(['cat', file_path])
+
+    def _write(self, file_path: str, contents: str, pipe_operator: str) -> None:
+        with NamedTemporaryFile(mode='r+') as f:
+            f.write(contents)
+            f.seek(0)
+            self.check_call(['cat', pipe_operator, file_path], stdin=f, text=True)
+
+    def write(self, file_path: str, contents: str) -> None:
+        self._write(file_path, contents, '>')
+
+    def append(self, file_path: str, *contents: str) -> None:
+        self._write(file_path, '\n' + '\n'.join(contents), '>>')
+
+def provision() -> None:
+    parser = argparse.ArgumentParser(description='Provision audio streaming services on one or more hosts.')
+    parser.add_argument(
+        '--local-host',
+        action='store_true',
+        default=False,
+        help='Provision the host you are currently running Muse on.',
+    )
+    parser.add_argument(
+        '--ssh-host',
+        action='store',
+        default=[],
+        dest='ssh_hosts',
+        type=str,
+        nargs='+',
+        metavar='[user@]host',
+        help='Provision the specified remote SSH host.',
+    )
+    parser.add_argument(
+        '--ssh',
+        action='store',
+        default=SSH,
+        type=str,
+        help=f'Provide a custom way of invoking the OpenSSH client. Example: `ssh -o "StrictHostKeyChecking=no" -i ./id_rsa`. Defaults to `{SSH}`.',
+    )
+    parser.add_argument(
+        '--no-bluetooth',
+        action='store_false',
+        default=True,
+        dest='bluetooth',
+        help='Do not provision Bluetooth on the host(s).',
+    )
+
+    args = parser.parse_args()
+    provision_local_host: bool = args.local_host
+    provision_ssh_hosts: List[str] = args.ssh_hosts
+    ssh: str = args.ssh.split()
+    bluetooth: bool = args.bluetooth
+    hosts: List[Host] = []
+    if provision_local_host:
+        hosts.append(LocalHost())
+    for ssh_host in provision_ssh_hosts:
+        hosts.append(SshHost(ssh, ssh_host))
+
+    if not hosts:
+        local_host_input = input('You did not specify any hosts. Do you want to provision the host you are currently running Muse on? [y/N]: ')
+        if local_host_input.lower() in YESES:
+            hosts.append(LocalHost())
+        else:
+            print('No hosts were specified. There is nothing to provision.')
+            return
+
+    for host in hosts:
+        if bluetooth:
+            host.apt_update()
+            _provision_bluetooth(host)
+
+def _provision_bluetooth(host: Host) -> None:
+    host.apt_install('lsb-release')
+    distributor = host.check_output(['lsb_release', '-si'])
+    version = host.check_output(['lsb_release', '-sr'])
+
+    # Debian 12 (Bookworm) will likely ship with bluealsa, so add the testing repo for earlier versions.
+    if distributor == 'Debian' and int(version) < 12:
+        host.append(
+            '/etc/apt/sources.list',
+            'deb http://http.us.debian.org/debian testing main',
+            'deb-src http://http.us.debian.org/debian testing main',
+        )
+        host.apt_update()
+
+    host.apt_install('bluez-alsa-utils')
+    bluez_alsa_service_path = '/lib/systemd/system/bluez-alsa.service'
+    bluez_alsa_service = host.read(bluez_alsa_service_path)
+    bluez_alsa_service = bluez_alsa_service.replace('ExecStart=/usr/bin/bluealsa', 'ExecStart=/usr/bin/bluealsa -p a2dp-sink')
+    host.write(bluez_alsa_service_path, bluez_alsa_service)
+
+
+if __name__ == '__main__':
+    provision()
