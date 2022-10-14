@@ -8,6 +8,14 @@ AVAILABLE_IMAGES=(ubuntu:22.10 ubuntu:22.04 debian:bullseye)
 
 image=${1:-}
 
+docker_run()
+{
+  local image=$1
+  local options=$2
+  local command=$3
+  docker run $options --rm --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run  --cap-add SYS_ADMIN --privileged "$image" $command
+}
+
 docker_stop()
 {
   local container_id=$1
@@ -21,7 +29,7 @@ test_image()
   ./bin/.build-test-docker-images "$image"
 
   # Test the provisioning by running it on a local host.
-  docker run --rm -v "$(pwd):/opt/muse" "muse-test-local-host-$image" /opt/muse/bin/muse --local-host
+  docker_run "muse-test-local-host-$image" "-v $(pwd):/opt/muse" '/opt/muse/bin/muse --local-host --spotify-configuration /opt/muse/tests/docker/base-host/spotifyd.conf'
 
   # Test the provisioning by running it on an SSH host.
   local tmp_dir
@@ -29,11 +37,11 @@ test_image()
   cp ./tests/docker/ssh-host/id_rsa "$tmp_dir/id_rsa"
   chmod 600 "$tmp_dir/id_rsa"
   local ssh_host_container_id
-  ssh_host_container_id=$(docker run --detach --rm "muse-test-ssh-host-$image")
+  ssh_host_container_id=$(docker_run "muse-test-ssh-host-$image" '--detach' '')
   sleep 1
   local ssh_host_ip
   ssh_host_ip=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ssh_host_container_id")
-  if ! ./bin/muse --ssh-host "root@$ssh_host_ip" --ssh "ssh -q -i $tmp_dir/id_rsa -o StrictHostKeyChecking=no"; then
+  if ! ./bin/muse --ssh-host "root@$ssh_host_ip" --ssh "ssh -q -i $tmp_dir/id_rsa -o StrictHostKeyChecking=no"  --spotify-configuration ./tests/docker/base-host/spotifyd.conf; then
     docker_stop "$ssh_host_container_id"
     rm -r "$tmp_dir"
     exit 1

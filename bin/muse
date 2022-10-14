@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import shlex
 import subprocess
+from os import PathLike
 from tempfile import NamedTemporaryFile
-from typing import List
+from typing import List, Union, Sequence
 
 YESES = [
     'y',
@@ -14,15 +16,25 @@ YESES = [
     'yeehaw',
 ]
 
+# From typeshed.
+StrOrBytesPath = Union[
+    str,
+    bytes,
+    PathLike,
+]
+
+# From subprocess._CMD.
+_CMD = Union[StrOrBytesPath, Sequence[StrOrBytesPath]]
+
 
 SSH = 'ssh -T'
 
 
 class Host:
-    def check_call(self, args, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
+    def check_call(self, args: _CMD, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
         raise NotImplemented
 
-    def check_output(self, args, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
+    def check_output(self, args: _CMD, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
         raise NotImplemented
 
     def read(self, file_path: str) -> str:
@@ -42,10 +54,10 @@ class Host:
 
 
 class LocalHost(Host):
-    def check_call(self, args, *subprocess_check_call_args, **subprocess_check_output_kwargs) -> None:
+    def check_call(self, args: _CMD, *subprocess_check_call_args, **subprocess_check_output_kwargs) -> None:
         subprocess.check_call(args, *subprocess_check_call_args, **subprocess_check_output_kwargs)
 
-    def check_output(self, args, *subprocess_check_output_args, **subprocess_check_call_kwargs) -> str:
+    def check_output(self, args: _CMD, *subprocess_check_output_args, **subprocess_check_call_kwargs) -> str:
         return subprocess.check_output(args, *subprocess_check_output_args, **subprocess_check_call_kwargs).decode('utf-8').strip()
 
     def read(self, file_path: str) -> str:
@@ -62,15 +74,15 @@ class LocalHost(Host):
 
 
 class SshHost(Host):
-    def __init__(self, ssh: str, host: str):
+    def __init__(self, ssh: List[str], host: str):
         self._ssh = ssh
         self._host = host
 
-    def check_call(self, args, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
-        subprocess.check_call([*self._ssh, self._host, *args], *subprocess_check_call_args, **subprocess_check_call_kwargs)
+    def check_call(self, args: _CMD, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
+        subprocess.check_call([*self._ssh, self._host, *map(shlex.quote, args)], *subprocess_check_call_args, **subprocess_check_call_kwargs)
 
-    def check_output(self, args, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
-        return subprocess.check_output([*self._ssh, self._host, *args], *subprocess_check_output_args, **subprocess_check_output_kwargs).decode('utf-8').strip()
+    def check_output(self, args: _CMD, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
+        return subprocess.check_output([*self._ssh, self._host, *map(shlex.quote, args)], *subprocess_check_output_args, **subprocess_check_output_kwargs).decode('utf-8').strip()
 
     def read(self, file_path: str) -> str:
         return self.check_output(['cat', file_path])
@@ -79,7 +91,7 @@ class SshHost(Host):
         with NamedTemporaryFile(mode='r+') as f:
             f.write(contents)
             f.seek(0)
-            self.check_call(['cat', pipe_operator, file_path], stdin=f, text=True)
+            self.check_call(['sh', '-c', f'cat {pipe_operator} {file_path}'], stdin=f, text=True)
 
     def write(self, file_path: str, contents: str) -> None:
         self._write(file_path, contents, '>')
@@ -119,12 +131,28 @@ def provision() -> None:
         dest='bluetooth',
         help='Do not provision Bluetooth on the host(s).',
     )
+    spotify_group = parser.add_mutually_exclusive_group(required=True)
+    spotify_group.add_argument(
+        '--no-spotify',
+        action='store_false',
+        default=True,
+        dest='spotify',
+        help='Do not provision Spotify on the host(s).',
+    )
+    spotify_group.add_argument(
+        '--spotify-configuration',
+        action='store',
+        dest='spotifyd_configuration_file_path',
+        help='The file path to the spotifyd configuration file to provision. See https://spotifyd.github.io/spotifyd/config/File.html.',
+    )
 
     args = parser.parse_args()
     provision_local_host: bool = args.local_host
     provision_ssh_hosts: List[str] = args.ssh_hosts
-    ssh: str = args.ssh.split()
+    ssh: List[str] = args.ssh.split()
     bluetooth: bool = args.bluetooth
+    spotify: bool = args.spotify
+    spotifyd_configuration_file_path: str = args.spotifyd_configuration_file_path
     hosts: List[Host] = []
     if provision_local_host:
         hosts.append(LocalHost())
@@ -132,7 +160,7 @@ def provision() -> None:
         hosts.append(SshHost(ssh, ssh_host))
 
     if not hosts:
-        local_host_input = input('You did not specify any hosts. Do you want to provision the host you are currently running Muse on? [y/N]: ')
+        local_host_input = input('You did not specify any hosts. Do you want to provision the local host you are currently running Muse on? [y/N]: ')
         if local_host_input.lower() in YESES:
             hosts.append(LocalHost())
         else:
@@ -140,9 +168,12 @@ def provision() -> None:
             return
 
     for host in hosts:
-        if bluetooth:
+        if bluetooth or spotify:
             host.apt_update()
+        if bluetooth:
             _provision_bluetooth(host)
+        if spotify:
+            _provision_spotify(host, spotifyd_configuration_file_path)
 
 def _provision_bluetooth(host: Host) -> None:
     host.apt_install('lsb-release')
@@ -163,6 +194,19 @@ def _provision_bluetooth(host: Host) -> None:
     bluez_alsa_service = host.read(bluez_alsa_service_path)
     bluez_alsa_service = bluez_alsa_service.replace('ExecStart=/usr/bin/bluealsa', 'ExecStart=/usr/bin/bluealsa -p a2dp-sink')
     host.write(bluez_alsa_service_path, bluez_alsa_service)
+
+def _provision_spotify(host: Host, spotifyd_configuration_file_path: str) -> None:
+    home_directory_path = host.check_output(['sh', '-c', 'echo $HOME'])
+    with open (spotifyd_configuration_file_path) as f:
+        configuration = f.read()
+    host.check_call(['mkdir', '-p', f'{home_directory_path}/.config/spotifyd'])
+    host.write(f'{home_directory_path}/.config/spotifyd/spotifyd.conf', configuration)
+    host.apt_install('build-essential', 'curl', 'git', 'libasound2-dev', 'libssl-dev', 'pkg-config')
+    host.check_call(['sh', '-c', 'curl --proto https --tlsv1.2 https://sh.rustup.rs -sSf | sh -s -- -y'])
+    host.check_call(['git', 'clone', 'https://github.com/Spotifyd/spotifyd.git'])
+    host.check_call([f'{home_directory_path}/.cargo/bin/cargo', 'build', '--release', '--manifest-path', './spotifyd/Cargo.toml'])
+    host.check_call(['cp', './spotifyd/contrib/spotifyd.service', '/etc/systemd/system/'])
+    host.check_call(['ln', '-s', '/etc/systemd/system/spotifyd.service', '/lib/systemd/system/local-fs.target.wants/spotifyd.service'])
 
 
 if __name__ == '__main__':
