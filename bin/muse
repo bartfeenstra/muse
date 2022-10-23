@@ -40,17 +40,17 @@ class Host:
     def read(self, file_path: str) -> str:
         raise NotImplemented
 
-    def write(self, file_path: str, contents: str) -> None:
+    def write(self, file_path: str, contents: str, sudo: bool = False) -> None:
         raise NotImplemented
 
-    def append(self, file_path: str, *contents: str) -> None:
+    def append(self, file_path: str, *contents: str, sudo: bool = False) -> None:
         raise NotImplemented
 
     def apt_update(self) -> None:
-        self.check_call(['apt-get', 'update'])
+        self.check_call(['sudo', 'apt-get', 'update'])
 
     def apt_install(self, *package: str) -> None:
-        self.check_call(['apt-get', 'install', '-y', *package])
+        self.check_call(['sudo', 'apt-get', 'install', '-y', *package])
 
 
 class LocalHost(Host):
@@ -64,11 +64,11 @@ class LocalHost(Host):
         with open (file_path) as f:
             return f.read()
 
-    def write(self, file_path: str, contents: str) -> None:
+    def write(self, file_path: str, contents: str, sudo: bool = False) -> None:
         with open(file_path, 'w') as f:
             f.write(contents)
 
-    def append(self, file_path: str, *contents: str) -> None:
+    def append(self, file_path: str, *contents: str, sudo: bool = False) -> None:
         with open(file_path, 'a') as f:
             f.write('\n'.join(contents))
 
@@ -87,17 +87,20 @@ class SshHost(Host):
     def read(self, file_path: str) -> str:
         return self.check_output(['cat', file_path])
 
-    def _write(self, file_path: str, contents: str, pipe_operator: str) -> None:
+    def _write(self, file_path: str, contents: str, sudo: bool, tee_options: str) -> None:
         with NamedTemporaryFile(mode='r+') as f:
             f.write(contents)
             f.seek(0)
-            self.check_call(['sh', '-c', f'cat {pipe_operator} {file_path}'], stdin=f, text=True)
+            command = f'tee {tee_options} {file_path}'
+            if sudo:
+                command = f'sudo {command}'
+            self.check_call(['sh', '-c', command], stdin=f, text=True)
 
-    def write(self, file_path: str, contents: str) -> None:
-        self._write(file_path, contents, '>')
+    def write(self, file_path: str, contents: str, sudo: bool = False) -> None:
+        self._write(file_path, contents, sudo, '')
 
-    def append(self, file_path: str, *contents: str) -> None:
-        self._write(file_path, '\n' + '\n'.join(contents), '>>')
+    def append(self, file_path: str, *contents: str, sudo: bool = False) -> None:
+        self._write(file_path, '\n' + '\n'.join(contents), sudo, '-a')
 
 def provision() -> None:
     parser = argparse.ArgumentParser(description='Provision audio streaming services on one or more hosts.')
@@ -170,6 +173,7 @@ def provision() -> None:
     for host in hosts:
         if bluetooth or spotify:
             host.apt_update()
+            host.apt_install('sudo')
         if bluetooth:
             _provision_bluetooth(host)
         if spotify:
@@ -197,16 +201,20 @@ def _provision_bluetooth(host: Host) -> None:
 
 def _provision_spotify(host: Host, spotifyd_configuration_file_path: str) -> None:
     home_directory_path = host.check_output(['sh', '-c', 'echo $HOME'])
+    host.check_call(['mkdir', '-p', './muse'])
     with open (spotifyd_configuration_file_path) as f:
         configuration = f.read()
-    host.check_call(['mkdir', '-p', f'{home_directory_path}/.config/spotifyd'])
-    host.write(f'{home_directory_path}/.config/spotifyd/spotifyd.conf', configuration)
+    host.write('./muse/spotifyd.conf', configuration, True)
     host.apt_install('build-essential', 'curl', 'git', 'libasound2-dev', 'libssl-dev', 'pkg-config')
     host.check_call(['sh', '-c', 'curl --proto https --tlsv1.2 https://sh.rustup.rs -sSf | sh -s -- -y'])
-    host.check_call(['git', 'clone', 'https://github.com/Spotifyd/spotifyd.git'])
-    host.check_call([f'{home_directory_path}/.cargo/bin/cargo', 'build', '--release', '--manifest-path', './spotifyd/Cargo.toml'])
-    host.check_call(['cp', './spotifyd/contrib/spotifyd.service', '/etc/systemd/system/'])
-    host.check_call(['ln', '-s', '/etc/systemd/system/spotifyd.service', '/lib/systemd/system/local-fs.target.wants/spotifyd.service'])
+    host.check_call(['sh', '-c', 'if ! (cd ./muse/spotifyd && git pull); then cd ./muse && git clone https://github.com/Spotifyd/spotifyd.git; fi'])
+    host.check_call([f'{home_directory_path}/.cargo/bin/cargo', 'build', '--release', '--manifest-path', './muse/spotifyd/Cargo.toml'])
+    service = host.read('./spotifyd/contrib/spotifyd.service')
+    service = service.replace('ExecStart=/usr/bin/spotifyd --no-daemon', f'ExecStart={home_directory_path}/muse/spotifyd/target/release/spotifyd --no-daemon --config-path {home_directory_path}/muse/spotifyd.conf')
+    host.write('/etc/systemd/system/spotifyd.service', service, True)
+    host.check_call(['sudo', 'systemctl', 'daemon-reload'])
+    host.check_call(['sudo', 'systemctl', 'enable', 'spotifyd.service', '--now'])
+    host.check_call(['sudo', 'systemctl', 'restart', 'spotifyd.service'])
 
 
 if __name__ == '__main__':
