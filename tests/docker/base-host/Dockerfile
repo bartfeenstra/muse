@@ -4,6 +4,7 @@ ENV container docker
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+      sudo \
       systemd \
       systemd-sysv && \
     # Clean up APT.
