@@ -201,16 +201,16 @@ def _provision_bluetooth(host: Host) -> None:
 
 def _provision_spotify(host: Host, spotifyd_configuration_file_path: str) -> None:
     home_directory_path = host.check_output(['sh', '-c', 'echo $HOME'])
-    host.check_call(['mkdir', '-p', './muse'])
+    host.check_call(['mkdir', '-p', './.muse'])
     with open (spotifyd_configuration_file_path) as f:
         configuration = f.read()
-    host.write('./muse/spotifyd.conf', configuration, True)
+    host.write('./.muse/spotifyd.conf', configuration, True)
     host.apt_install('build-essential', 'curl', 'git', 'libasound2-dev', 'libssl-dev', 'pkg-config')
     host.check_call(['sh', '-c', 'curl --proto https --tlsv1.2 https://sh.rustup.rs -sSf | sh -s -- -y'])
-    host.check_call(['sh', '-c', 'if ! (cd ./muse/spotifyd && git pull); then cd ./muse && git clone https://github.com/Spotifyd/spotifyd.git; fi'])
-    host.check_call([f'{home_directory_path}/.cargo/bin/cargo', 'build', '--release', '--manifest-path', './muse/spotifyd/Cargo.toml'])
-    service = host.read('./spotifyd/contrib/spotifyd.service')
-    service = service.replace('ExecStart=/usr/bin/spotifyd --no-daemon', f'ExecStart={home_directory_path}/muse/spotifyd/target/release/spotifyd --no-daemon --config-path {home_directory_path}/muse/spotifyd.conf')
+    host.check_call(['sh', '-c', 'if ! (cd ./.muse/spotifyd && git pull); then cd ./.muse && git clone https://github.com/Spotifyd/spotifyd.git; fi'])
+    host.check_call([f'{home_directory_path}/.cargo/bin/cargo', 'build', '--release', '--manifest-path', './.muse/spotifyd/Cargo.toml'])
+    service = host.read('./.muse/spotifyd/contrib/spotifyd.service')
+    service = service.replace('ExecStart=/usr/bin/spotifyd --no-daemon', f'ExecStart={home_directory_path}/.muse/spotifyd/target/release/spotifyd --no-daemon --config-path {home_directory_path}/.muse/spotifyd.conf')
     host.write('/etc/systemd/system/spotifyd.service', service, True)
     host.check_call(['sudo', 'systemctl', 'daemon-reload'])
     host.check_call(['sudo', 'systemctl', 'enable', 'spotifyd.service', '--now'])
