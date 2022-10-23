@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+set -Eeuox pipefail
+
+host_os_docker_image=$1
+
+HOST_TYPES=(base local ssh)
+for host_type in "${HOST_TYPES[@]}"; do
+  (
+    cd "./tests/docker/$host_type-host"
+    docker build -t "muse-test-$host_type-host-$host_os_docker_image" --build-arg "FROM=$host_os_docker_image" .
+  )
+done

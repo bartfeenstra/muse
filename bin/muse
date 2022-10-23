@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import argparse
+import shlex
+import subprocess
+from os import PathLike
+from tempfile import NamedTemporaryFile
+from typing import List, Union, Sequence
+
+YESES = [
+    'y',
+    'ye',
+    'yes',
+    'yess',
+    'yesss',
+    'yeah',
+    'yeehaw',
+]
+
+# From typeshed.
+StrOrBytesPath = Union[
+    str,
+    bytes,
+    PathLike,
+]
+
+# From subprocess._CMD.
+_CMD = Union[StrOrBytesPath, Sequence[StrOrBytesPath]]
+
+
+SSH = 'ssh -T'
+
+
+class Host:
+    def check_call(self, args: _CMD, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
+        raise NotImplemented
+
+    def check_output(self, args: _CMD, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
+        raise NotImplemented
+
+    def read(self, file_path: str) -> str:
+        raise NotImplemented
+
+    def write(self, file_path: str, contents: str, sudo: bool = False) -> None:
+        raise NotImplemented
+
+    def append(self, file_path: str, *contents: str, sudo: bool = False) -> None:
+        raise NotImplemented
+
+    def apt_update(self) -> None:
+        self.check_call(['sudo', 'apt-get', 'update'])
+
+    def apt_install(self, *package: str) -> None:
+        self.check_call(['sudo', 'apt-get', 'install', '-y', *package])
+
+
+class LocalHost(Host):
+    def check_call(self, args: _CMD, *subprocess_check_call_args, **subprocess_check_output_kwargs) -> None:
+        subprocess.check_call(args, *subprocess_check_call_args, **subprocess_check_output_kwargs)
+
+    def check_output(self, args: _CMD, *subprocess_check_output_args, **subprocess_check_call_kwargs) -> str:
+        return subprocess.check_output(args, *subprocess_check_output_args, **subprocess_check_call_kwargs).decode('utf-8').strip()
+
+    def read(self, file_path: str) -> str:
+        with open (file_path) as f:
+            return f.read()
+
+    def write(self, file_path: str, contents: str, sudo: bool = False) -> None:
+        with open(file_path, 'w') as f:
+            f.write(contents)
+
+    def append(self, file_path: str, *contents: str, sudo: bool = False) -> None:
+        with open(file_path, 'a') as f:
+            f.write('\n'.join(contents))
+
+
+class SshHost(Host):
+    def __init__(self, ssh: List[str], host: str):
+        self._ssh = ssh
+        self._host = host
+
+    def check_call(self, args: _CMD, *subprocess_check_call_args, **subprocess_check_call_kwargs) -> None:
+        subprocess.check_call([*self._ssh, self._host, *map(shlex.quote, args)], *subprocess_check_call_args, **subprocess_check_call_kwargs)
+
+    def check_output(self, args: _CMD, *subprocess_check_output_args, **subprocess_check_output_kwargs) -> str:
+        return subprocess.check_output([*self._ssh, self._host, *map(shlex.quote, args)], *subprocess_check_output_args, **subprocess_check_output_kwargs).decode('utf-8').strip()
+
+    def read(self, file_path: str) -> str:
+        return self.check_output(['cat', file_path])
+
+    def _write(self, file_path: str, contents: str, sudo: bool, tee_options: str) -> None:
+        with NamedTemporaryFile(mode='r+') as f:
+            f.write(contents)
+            f.seek(0)
+            command = f'tee {tee_options} {file_path}'
+            if sudo:
+                command = f'sudo {command}'
+            self.check_call(['sh', '-c', command], stdin=f, text=True)
+
+    def write(self, file_path: str, contents: str, sudo: bool = False) -> None:
+        self._write(file_path, contents, sudo, '')
+
+    def append(self, file_path: str, *contents: str, sudo: bool = False) -> None:
+        self._write(file_path, '\n' + '\n'.join(contents), sudo, '-a')
+
+def provision() -> None:
+    parser = argparse.ArgumentParser(description='Provision audio streaming services on one or more hosts.')
+    parser.add_argument(
+        '--local-host',
+        action='store_true',
+        default=False,
+        help='Provision the host you are currently running Muse on.',
+    )
+    parser.add_argument(
+        '--ssh-host',
+        action='store',
+        default=[],
+        dest='ssh_hosts',
+        type=str,
+        nargs='+',
+        metavar='[user@]host',
+        help='Provision the specified remote SSH host.',
+    )
+    parser.add_argument(
+        '--ssh',
+        action='store',
+        default=SSH,
+        type=str,
+        help=f'Provide a custom way of invoking the OpenSSH client. Example: `ssh -o "StrictHostKeyChecking=no" -i ./id_rsa`. Defaults to `{SSH}`.',
+    )
+    parser.add_argument(
+        '--no-bluetooth',
+        action='store_false',
+        default=True,
+        dest='bluetooth',
+        help='Do not provision Bluetooth on the host(s).',
+    )
+    spotify_group = parser.add_mutually_exclusive_group(required=True)
+    spotify_group.add_argument(
+        '--no-spotify',
+        action='store_false',
+        default=True,
+        dest='spotify',
+        help='Do not provision Spotify on the host(s).',
+    )
+    spotify_group.add_argument(
+        '--spotify-configuration',
+        action='store',
+        dest='spotifyd_configuration_file_path',
+        help='The file path to the spotifyd configuration file to provision. See https://spotifyd.github.io/spotifyd/config/File.html.',
+    )
+
+    args = parser.parse_args()
+    provision_local_host: bool = args.local_host
+    provision_ssh_hosts: List[str] = args.ssh_hosts
+    ssh: List[str] = args.ssh.split()
+    bluetooth: bool = args.bluetooth
+    spotify: bool = args.spotify
+    spotifyd_configuration_file_path: str = args.spotifyd_configuration_file_path
+    hosts: List[Host] = []
+    if provision_local_host:
+        hosts.append(LocalHost())
+    for ssh_host in provision_ssh_hosts:
+        hosts.append(SshHost(ssh, ssh_host))
+
+    if not hosts:
+        local_host_input = input('You did not specify any hosts. Do you want to provision the local host you are currently running Muse on? [y/N]: ')
+        if local_host_input.lower() in YESES:
+            hosts.append(LocalHost())
+        else:
+            print('No hosts were specified. There is nothing to provision.')
+            return
+
+    for host in hosts:
+        if bluetooth or spotify:
+            host.apt_update()
+            host.apt_install('sudo')
+        if bluetooth:
+            _provision_bluetooth(host)
+        if spotify:
+            _provision_spotify(host, spotifyd_configuration_file_path)
+
+def _provision_bluetooth(host: Host) -> None:
+    host.apt_install('lsb-release')
+    distributor = host.check_output(['lsb_release', '-si'])
+    version = host.check_output(['lsb_release', '-sr'])
+
+    # Debian 12 (Bookworm) will likely ship with bluealsa, so add the testing repo for earlier versions.
+    if distributor == 'Debian' and int(version) < 12:
+        host.append(
+            '/etc/apt/sources.list',
+            'deb http://http.us.debian.org/debian testing main',
+            'deb-src http://http.us.debian.org/debian testing main',
+        )
+        host.apt_update()
+
+    host.apt_install('bluez-alsa-utils')
+    bluez_alsa_service_path = '/lib/systemd/system/bluez-alsa.service'
+    bluez_alsa_service = host.read(bluez_alsa_service_path)
+    bluez_alsa_service = bluez_alsa_service.replace('ExecStart=/usr/bin/bluealsa', 'ExecStart=/usr/bin/bluealsa -p a2dp-sink')
+    host.write(bluez_alsa_service_path, bluez_alsa_service)
+
+def _provision_spotify(host: Host, spotifyd_configuration_file_path: str) -> None:
+    home_directory_path = host.check_output(['sh', '-c', 'echo $HOME'])
+    host.check_call(['mkdir', '-p', './.muse'])
+    with open (spotifyd_configuration_file_path) as f:
+        configuration = f.read()
+    host.write('./.muse/spotifyd.conf', configuration, True)
+    host.apt_install('build-essential', 'curl', 'git', 'libasound2-dev', 'libssl-dev', 'pkg-config')
+    host.check_call(['sh', '-c', 'curl --proto https --tlsv1.2 https://sh.rustup.rs -sSf | sh -s -- -y'])
+    host.check_call(['sh', '-c', 'if ! (cd ./.muse/spotifyd && git pull); then cd ./.muse && git clone https://github.com/Spotifyd/spotifyd.git; fi'])
+    host.check_call([f'{home_directory_path}/.cargo/bin/cargo', 'build', '--release', '--manifest-path', './.muse/spotifyd/Cargo.toml'])
+    service = host.read('./.muse/spotifyd/contrib/spotifyd.service')
+    service = service.replace('ExecStart=/usr/bin/spotifyd --no-daemon', f'ExecStart={home_directory_path}/.muse/spotifyd/target/release/spotifyd --no-daemon --config-path {home_directory_path}/.muse/spotifyd.conf')
+    host.write('/etc/systemd/system/spotifyd.service', service, True)
+    host.check_call(['sudo', 'systemctl', 'daemon-reload'])
+    host.check_call(['sudo', 'systemctl', 'enable', 'spotifyd.service', '--now'])
+    host.check_call(['sudo', 'systemctl', 'restart', 'spotifyd.service'])
+
+
+if __name__ == '__main__':
+    provision()
